@@ -1,0 +1,195 @@
+name: Deploy to Cloudflare Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_admin:
+        description: "强制用仓库 secret ADMIN 重置管理密码（默认只在首次建项目时设置）"
+        required: false
+        type: boolean
+        default: false
+
+  workflow_run:
+    workflows: ["Upstream Sync"]
+    types: [completed]
+
+  push:
+    branches: [main]
+    paths:
+      - "_worker.js"
+      - "wrangler.toml"
+
+concurrency:
+  group: cf-pages-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to Pages
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+
+    env:
+      PROJECT_NAME: relay-pages-26
+      KV_TITLE: relay-kv-26
+      COMPAT_DATE: "2025-11-04"
+      OP_ENV_ID: cyabk5r5mgusn4s235akppesoq
+      OP_CF_TOKEN_VAR: cloudflare
+      OP_ADMIN_VAR: ADMIN
+      FORCE_ADMIN: ${{ inputs.force_admin || false }}
+      OP_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install wrangler
+        run: npm install -g wrangler@4
+
+      - name: Install 1Password CLI (beta)
+        if: ${{ env.OP_TOKEN != '' }}
+        uses: 1password/install-cli-action@v4
+        with:
+          version: latest-beta
+
+      - name: Resolve secrets (Cloudflare token + ADMIN)
+        run: |
+          set -euo pipefail
+          TOKEN=""
+          ADMIN_VALUE=""
+
+          if [ -n "${OP_TOKEN:-}" ] && command -v op >/dev/null 2>&1; then
+            echo "==> 用 service account 读取 1Password Environment"
+            if op user get --me >/dev/null 2>&1; then
+
+              SEC_DIR="$(mktemp -d)"
+              chmod 700 "$SEC_DIR"
+              if op run --environment "$OP_ENV_ID" -- bash -c \
+                   "umask 077; printf '%s' \"\${$OP_CF_TOKEN_VAR}\" > \"\$1/cf_token\"; printf '%s' \"\${$OP_ADMIN_VAR:-}\" > \"\$1/admin\"" \
+                   _ "$SEC_DIR" 2>/dev/null; then
+                [ -s "$SEC_DIR/cf_token" ] && TOKEN="$(cat "$SEC_DIR/cf_token")"
+                [ -s "$SEC_DIR/admin" ] && ADMIN_VALUE="$(cat "$SEC_DIR/admin")"
+              else
+                echo "==> 读取 1Password Environment 失败"
+                echo "==> 确认该 service account 创建时勾选了此 Environment 的 Read 权限"
+                echo "==> （Environment 授权在创建 service account 时定死，之后改不了，需新建一个）"
+              fi
+              rm -rf "$SEC_DIR"
+            else
+              echo "==> service account 认证失败，检查 OP_SERVICE_ACCOUNT_TOKEN"
+            fi
+          fi
+
+          if [ -z "$TOKEN" ]; then
+            echo "::error::未能从 1Password Environment (edgetunnel) 取到 cloudflare 令牌"
+            echo "::error::检查 OP_SERVICE_ACCOUNT_TOKEN，以及该 service account 是否勾选了 edgetunnel 环境"
+            exit 1
+          fi
+          echo "==> cloudflare 令牌已获取"
+          [ -n "$ADMIN_VALUE" ] && echo "==> ADMIN 已获取" || echo "==> ADMIN 为空，本次不设置管理密码"
+
+          echo "::add-mask::$TOKEN"
+          [ -n "$ADMIN_VALUE" ] && echo "::add-mask::$ADMIN_VALUE"
+          echo "CLOUDFLARE_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          echo "ADMIN_PASSWORD=$ADMIN_VALUE" >> "$GITHUB_ENV"
+
+      - name: Resolve account id
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(curl -fsS "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].id // empty')"
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "::error::无法获取 account id，请确认令牌具备 Account Settings:Read 权限"
+            exit 1
+          fi
+          echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
+          echo "account id = $ACCOUNT_ID"
+
+      - name: Ensure KV namespace
+        run: |
+          set -euo pipefail
+          lookup() {
+            wrangler kv namespace list 2>/dev/null \
+              | jq -r --arg t "$KV_TITLE" '.[]? | select(.title == $t) | .id' | head -n1
+          }
+          KV_ID="$(lookup)"
+          if [ -z "$KV_ID" ] || [ "$KV_ID" = "null" ]; then
+            echo "==> KV 不存在，创建中"
+            wrangler kv namespace create "$KV_TITLE" >/dev/null
+            KV_ID="$(lookup)"
+          else
+            echo "==> KV 已存在，复用中"
+          fi
+          if [ -z "$KV_ID" ] || [ "$KV_ID" = "null" ]; then
+            echo "::error::KV 命名空间处理失败"
+            exit 1
+          fi
+          echo "::add-mask::$KV_ID"
+          echo "KV_ID=$KV_ID" >> "$GITHUB_ENV"
+
+      - name: Ensure Pages project
+        run: |
+          set -euo pipefail
+          if wrangler pages project list --json 2>/dev/null \
+             | jq -e --arg p "$PROJECT_NAME" '.[]? | select(."Project Name" == $p)' >/dev/null; then
+            echo "==> Pages 项目已存在，复用"
+            echo "PROJECT_CREATED=0" >> "$GITHUB_ENV"
+          else
+            echo "==> 创建 Pages 项目"
+            wrangler pages project create "$PROJECT_NAME" --production-branch main 2>&1 \
+              | sed -E 's#https?://[^[:space:]]+#<URL 已隐去>#g'
+            echo "PROJECT_CREATED=1" >> "$GITHUB_ENV"
+          fi
+
+          PROD_BRANCH="$(curl -fsS \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$PROJECT_NAME" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            | jq -r '.result.production_branch // "main"')"
+          echo "PROD_BRANCH=$PROD_BRANCH" >> "$GITHUB_ENV"
+          echo "==> production branch 已确认"
+
+      - name: Set ADMIN secret
+        if: ${{ (env.PROJECT_CREATED == '1' || env.FORCE_ADMIN == 'true') && env.ADMIN_PASSWORD != '' }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$ADMIN_PASSWORD" \
+            | wrangler pages secret put ADMIN --project-name "$PROJECT_NAME"
+          echo "==> ADMIN 管理密码已写入（加密存储，不回显）"
+
+      - name: Deploy
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          mkdir -p "$WORK/dist"
+          cp _worker.js "$WORK/dist/_worker.js"
+
+          {
+            printf 'name = "%s"\n' "$PROJECT_NAME"
+            printf 'pages_build_output_dir = "./dist"\n'
+            printf 'compatibility_date = "%s"\n' "$COMPAT_DATE"
+            printf '\n[[kv_namespaces]]\n'
+            printf 'binding = "KV"\n'
+            printf 'id = "%s"\n' "$KV_ID"
+          } > "$WORK/wrangler.toml"
+
+          cd "$WORK"
+          set +o pipefail
+          wrangler pages deploy --branch "$PROD_BRANCH" --commit-dirty=true 2>&1 \
+            | sed -E 's#https?://[^[:space:]]+#<URL 已隐去>#g'
+          STATUS=${PIPESTATUS[0]}
+          set -o pipefail
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::部署失败，退出码 $STATUS"
+            exit "$STATUS"
+          fi
+          echo "==> 部署成功"
