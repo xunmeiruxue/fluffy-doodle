@@ -40,7 +40,7 @@ jobs:
       OP_CF_TOKEN_VAR: cloudflare
       OP_ADMIN_VAR: ADMIN
       FORCE_ADMIN: ${{ inputs.force_admin || false }}
-      OP_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
 
     steps:
       - name: Checkout
@@ -57,7 +57,7 @@ jobs:
         run: npm install -g wrangler@4
 
       - name: Install 1Password CLI (beta)
-        if: ${{ env.OP_TOKEN != '' }}
+        if: ${{ env.OP_SERVICE_ACCOUNT_TOKEN != '' }}
         uses: 1password/install-cli-action@v4
         with:
           version: latest-beta
@@ -68,7 +68,7 @@ jobs:
           TOKEN=""
           ADMIN_VALUE=""
 
-          if [ -z "${OP_TOKEN:-}" ]; then
+          if [ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
             echo "::error::OP_SERVICE_ACCOUNT_TOKEN 未配置或为空"
             exit 1
           fi
@@ -79,11 +79,11 @@ jobs:
           fi
 
           # 格式自检：只打印长度和前缀判断，不回显内容
-          case "$OP_TOKEN" in
-            ops_*) echo "==> token 格式检查通过（ops_ 前缀，长度 ${#OP_TOKEN}）" ;;
-            *) echo "::error::token 不是 ops_ 开头（当前长度 ${#OP_TOKEN}），可能复制错了内容"; exit 1 ;;
+          case "$OP_SERVICE_ACCOUNT_TOKEN" in
+            ops_*) echo "==> token 格式检查通过（ops_ 前缀，长度 ${#OP_SERVICE_ACCOUNT_TOKEN}）" ;;
+            *) echo "::error::token 不是 ops_ 开头（当前长度 ${#OP_SERVICE_ACCOUNT_TOKEN}），可能复制错了内容"; exit 1 ;;
           esac
-          case "$OP_TOKEN" in
+          case "$OP_SERVICE_ACCOUNT_TOKEN" in
             *[[:space:]]*) echo "::error::token 含空白字符，复制时多半带入了换行或空格"; exit 1 ;;
           esac
 
