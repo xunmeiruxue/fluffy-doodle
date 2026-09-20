@@ -1,0 +1,209 @@
+name: Deploy to Cloudflare Worker
+
+# 与 deploy.yml（Pages 版本）完全独立的一套资源，互不干扰：
+#   Worker 名  relay-worker-26
+#   KV 命名空间 relay-worker-kv-26   ← 独立创建，不复用 Pages 的 relay-kv-26
+# 两个工作流可以同时自动部署，各自的 KV 数据互不影响。
+on:
+  workflow_dispatch:
+    inputs:
+      force_admin:
+        description: "强制用 1Password 里的 ADMIN 重置管理密码（默认只在缺失时写入）"
+        required: false
+        type: boolean
+        default: false
+
+  workflow_run:
+    workflows: ["Upstream Sync"]
+    types: [completed]
+
+  push:
+    branches: [main]
+    paths:
+      - "_worker.js"
+      - "wrangler.toml"
+      # 加自己，这样首次提交这个文件时就会自动跑一次，不用等手动触发
+      - ".github/workflows/deploy-worker.yml"
+
+concurrency:
+  group: cf-worker-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to Worker
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+
+    env:
+      WORKER_NAME: relay-worker-26
+      KV_TITLE: relay-worker-kv-26
+      COMPAT_DATE: "2025-11-04"
+      OP_ENV_ID: cyabk5r5mgusn4s235akppesoq
+      OP_CF_TOKEN_VAR: cloudflare
+      OP_ADMIN_VAR: ADMIN
+      FORCE_ADMIN: ${{ inputs.force_admin || false }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Install wrangler
+        run: npm install -g wrangler@4
+
+      - name: Install 1Password CLI (beta)
+        if: ${{ env.OP_SERVICE_ACCOUNT_TOKEN != '' }}
+        uses: 1password/install-cli-action@v4
+        with:
+          version: latest-beta
+
+      - name: Resolve secrets (Cloudflare token + ADMIN)
+        run: |
+          set -euo pipefail
+          TOKEN=""
+          ADMIN_VALUE=""
+
+          if [ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]; then
+            echo "::error::OP_SERVICE_ACCOUNT_TOKEN 未配置或为空"
+            exit 1
+          fi
+
+          if ! command -v op >/dev/null 2>&1; then
+            echo "::error::未找到 op CLI，检查 Install 1Password CLI 步骤"
+            exit 1
+          fi
+
+          case "$OP_SERVICE_ACCOUNT_TOKEN" in
+            ops_*) echo "==> token 格式检查通过（ops_ 前缀，长度 ${#OP_SERVICE_ACCOUNT_TOKEN}）" ;;
+            *) echo "::error::token 不是 ops_ 开头（当前长度 ${#OP_SERVICE_ACCOUNT_TOKEN}），可能复制错了内容"; exit 1 ;;
+          esac
+          case "$OP_SERVICE_ACCOUNT_TOKEN" in
+            *[[:space:]]*) echo "::error::token 含空白字符，复制时多半带入了换行或空格"; exit 1 ;;
+          esac
+
+          echo "==> 用 service account 读取 1Password Environment"
+          OP_ERRSHOWN="$(op user get --me 2>&1)" || {
+            echo "::error::service account 认证失败，op 原始输出："
+            echo "$OP_ERRSHOWN"
+            exit 1
+          }
+
+          SEC_DIR="$(mktemp -d)"
+          chmod 700 "$SEC_DIR"
+          if ! OP_ERR="$(op run --environment "$OP_ENV_ID" -- bash -c "umask 077; printf '%s' \"\${$OP_CF_TOKEN_VAR}\" > \"\$1/cf_token\"; printf '%s' \"\${$OP_ADMIN_VAR:-}\" > \"\$1/admin\"" _ "$SEC_DIR" 2>&1)"; then
+            echo "::error::读取 Environment 失败，op 原始报错："
+            echo "$OP_ERR"
+            echo "::error::常见原因：该 service account 创建时未勾选 edgetunnel 的 Read 权限（此授权创建后不可改，需新建）"
+            rm -rf "$SEC_DIR"
+            exit 1
+          fi
+          if [ -s "$SEC_DIR/cf_token" ]; then TOKEN="$(cat "$SEC_DIR/cf_token")"; fi
+          if [ -s "$SEC_DIR/admin" ]; then ADMIN_VALUE="$(cat "$SEC_DIR/admin")"; fi
+          rm -rf "$SEC_DIR"
+
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Environment 里没有读到变量 $OP_CF_TOKEN_VAR，检查变量名拼写"
+            exit 1
+          fi
+          echo "==> cloudflare 令牌已获取"
+          [ -n "$ADMIN_VALUE" ] && echo "==> ADMIN 已获取" || echo "==> ADMIN 为空，本次不设置管理密码"
+
+          echo "::add-mask::$TOKEN"
+          [ -n "$ADMIN_VALUE" ] && echo "::add-mask::$ADMIN_VALUE"
+          echo "CLOUDFLARE_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          echo "ADMIN_PASSWORD=$ADMIN_VALUE" >> "$GITHUB_ENV"
+
+      - name: Resolve account id
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(curl -fsS "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq -r '.result[0].id // empty')"
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "::error::无法获取 account id，请确认令牌具备 Account Settings:Read 权限"
+            exit 1
+          fi
+          echo "CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_ENV"
+          echo "account id = $ACCOUNT_ID"
+
+      # 独立的 KV：只认自己的 title，命中复用、未命中才建，绝不碰 Pages 那个
+      - name: Ensure KV namespace
+        run: |
+          set -euo pipefail
+          lookup() {
+            wrangler kv namespace list 2>/dev/null \
+              | jq -r --arg t "$KV_TITLE" '.[]? | select(.title == $t) | .id' | head -n1
+          }
+          KV_ID="$(lookup)"
+          if [ -z "$KV_ID" ] || [ "$KV_ID" = "null" ]; then
+            echo "==> KV 不存在，创建中（独立命名空间）"
+            wrangler kv namespace create "$KV_TITLE" >/dev/null
+            KV_ID="$(lookup)"
+          else
+            echo "==> KV 已存在，复用中"
+          fi
+          if [ -z "$KV_ID" ] || [ "$KV_ID" = "null" ]; then
+            echo "::error::KV 命名空间处理失败"
+            exit 1
+          fi
+          echo "::add-mask::$KV_ID"
+          echo "KV_ID=$KV_ID" >> "$GITHUB_ENV"
+
+      - name: Deploy
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          cp _worker.js "$WORK/_worker.js"
+
+          # Worker 用 main 指向入口（与 Pages 的 pages_build_output_dir 互斥）
+          {
+            printf 'name = "%s"\n' "$WORKER_NAME"
+            printf 'main = "_worker.js"\n'
+            printf 'compatibility_date = "%s"\n' "$COMPAT_DATE"
+            printf 'keep_vars = true\n'
+            printf '\n[[kv_namespaces]]\n'
+            printf 'binding = "KV"\n'
+            printf 'id = "%s"\n' "$KV_ID"
+          } > "$WORK/wrangler.toml"
+
+          cd "$WORK"
+          set +o pipefail
+          wrangler deploy 2>&1 | sed -E \
+            -e 's#https?://[^[:space:]]+#<URL 已隐去>#g' \
+            -e "s#${WORKER_NAME}#<Worker 名已隐去>#g"
+          STATUS=${PIPESTATUS[0]}
+          set -o pipefail
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::部署失败，退出码 $STATUS"
+            exit "$STATUS"
+          fi
+          echo "==> 部署成功"
+
+      # Worker 没有'项目创建'这个节点，所以改成：缺失就补，已存在就保留你改过的密码
+      - name: Ensure ADMIN secret
+        run: |
+          set -euo pipefail
+          if [ -z "${ADMIN_PASSWORD:-}" ]; then
+            echo "==> ADMIN 为空，本次不处理管理密码"
+            exit 0
+          fi
+          HAS_ADMIN=0
+          if wrangler secret list --name "$WORKER_NAME" --format json 2>/dev/null | grep -q '"ADMIN"'; then
+            HAS_ADMIN=1
+          fi
+          if [ "$HAS_ADMIN" = "1" ] && [ "$FORCE_ADMIN" != "true" ]; then
+            echo "==> ADMIN 已存在，保留现有密码（想用 1Password 里的值重置请勾 force_admin）"
+            exit 0
+          fi
+          printf '%s' "$ADMIN_PASSWORD" | wrangler secret put ADMIN --name "$WORKER_NAME" >/dev/null
+          echo "==> ADMIN 管理密码已写入（加密存储，不回显）"
