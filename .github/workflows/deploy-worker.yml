@@ -22,6 +22,7 @@ on:
     paths:
       - "_worker.js"
       - "wrangler.toml"
+      - ".github/obfuscator.json"
       # 加自己，这样首次提交这个文件时就会自动跑一次，不用等手动触发
       - ".github/workflows/deploy-worker.yml"
 
@@ -42,6 +43,7 @@ jobs:
       WORKER_NAME: relay-worker-26
       KV_TITLE: relay-worker-kv-26
       COMPAT_DATE: "2025-11-04"
+      OBFUSCATE: "true"
       OP_ENV_ID: cyabk5r5mgusn4s235akppesoq
       OP_CF_TOKEN_VAR: cloudflare
       OP_ADMIN_VAR: ADMIN
@@ -159,11 +161,27 @@ jobs:
           echo "::add-mask::$KV_ID"
           echo "KV_ID=$KV_ID" >> "$GITHUB_ENV"
 
+      - name: Obfuscate worker
+        if: ${{ env.OBFUSCATE == 'true' }}
+        run: |
+          set -euo pipefail
+          npm install -g javascript-obfuscator@5
+          javascript-obfuscator _worker.js \
+            --output "$RUNNER_TEMP/_worker.deploy.js" \
+            --config .github/obfuscator.json
+          cp "$RUNNER_TEMP/_worker.deploy.js" "$RUNNER_TEMP/check.mjs"
+          node --check "$RUNNER_TEMP/check.mjs"
+          echo "==> 混淆完成：$(stat -c%s "$RUNNER_TEMP/_worker.deploy.js") 字节，语法校验通过"
+
       - name: Deploy
         run: |
           set -euo pipefail
           WORK="$(mktemp -d)"
-          cp _worker.js "$WORK/_worker.js"
+          if [ "$OBFUSCATE" = "true" ]; then
+            cp "$RUNNER_TEMP/_worker.deploy.js" "$WORK/_worker.js"
+          else
+            cp _worker.js "$WORK/_worker.js"
+          fi
 
           # Worker 用 main 指向入口（与 Pages 的 pages_build_output_dir 互斥）
           {

@@ -18,6 +18,7 @@ on:
     paths:
       - "_worker.js"
       - "wrangler.toml"
+      - ".github/obfuscator.json"
 
 concurrency:
   group: cf-pages-deploy
@@ -36,6 +37,7 @@ jobs:
       PROJECT_NAME: relay-pages-26
       KV_TITLE: relay-kv-26
       COMPAT_DATE: "2025-11-04"
+      OBFUSCATE: "true"
       OP_ENV_ID: cyabk5r5mgusn4s235akppesoq
       OP_CF_TOKEN_VAR: cloudflare
       OP_ADMIN_VAR: ADMIN
@@ -183,12 +185,28 @@ jobs:
             | wrangler pages secret put ADMIN --project-name "$PROJECT_NAME"
           echo "==> ADMIN 管理密码已写入（加密存储，不回显）"
 
+      - name: Obfuscate worker
+        if: ${{ env.OBFUSCATE == 'true' }}
+        run: |
+          set -euo pipefail
+          npm install -g javascript-obfuscator@5
+          javascript-obfuscator _worker.js \
+            --output "$RUNNER_TEMP/_worker.deploy.js" \
+            --config .github/obfuscator.json
+          cp "$RUNNER_TEMP/_worker.deploy.js" "$RUNNER_TEMP/check.mjs"
+          node --check "$RUNNER_TEMP/check.mjs"
+          echo "==> 混淆完成：$(stat -c%s "$RUNNER_TEMP/_worker.deploy.js") 字节，语法校验通过"
+
       - name: Deploy
         run: |
           set -euo pipefail
           WORK="$(mktemp -d)"
           mkdir -p "$WORK/dist"
-          cp _worker.js "$WORK/dist/_worker.js"
+          if [ "$OBFUSCATE" = "true" ]; then
+            cp "$RUNNER_TEMP/_worker.deploy.js" "$WORK/dist/_worker.js"
+          else
+            cp _worker.js "$WORK/dist/_worker.js"
+          fi
 
           {
             printf 'name = "%s"\n' "$PROJECT_NAME"

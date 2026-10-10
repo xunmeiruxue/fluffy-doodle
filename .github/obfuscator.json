@@ -1,0 +1,31 @@
+{
+  "compact": true,
+  "identifierNamesGenerator": "mangled-shuffled",
+  "renameGlobals": false,
+  "renameProperties": false,
+  "transformObjectKeys": false,
+  "stringArray": true,
+  "stringArrayEncoding": [
+    "base64"
+  ],
+  "stringArrayThreshold": 0.75,
+  "stringArrayRotate": true,
+  "stringArrayShuffle": true,
+  "stringArrayWrappersCount": 1,
+  "stringArrayWrappersType": "variable",
+  "stringArrayWrappersChainedCalls": false,
+  "splitStrings": true,
+  "splitStringsChunkLength": 10,
+  "unicodeEscapeSequence": true,
+  "controlFlowFlattening": false,
+  "deadCodeInjection": false,
+  "selfDefending": false,
+  "debugProtection": false,
+  "disableConsoleOutput": false,
+  "comments": false,
+  "numbersToExpressions": false,
+  "simplify": true,
+  "target": "browser",
+  "sourceMap": false,
+  "seed": 20261010
+}
